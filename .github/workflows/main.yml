@@ -1,0 +1,82 @@
+name: .NET Event Driven CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+
+    services:
+      rabbitmq:
+        image: rabbitmq:3-management
+        ports:
+          - 5672:5672
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build -c Release --no-restore
+
+      - name: Run API + Consumer Integration Test
+        shell: bash
+        run: |
+          set -e
+
+          echo "Starting Consumer..."
+          dotnet run -c Release --project Orders.Consumer/Orders.Consumer.csproj > consumer.log 2>&1 &
+          CONSUMER_PID=$!
+
+          echo "Starting API..."
+          dotnet run -c Release --project Orders.Api/Orders.Api.csproj --urls http://localhost:5000 > api.log 2>&1 &
+          API_PID=$!
+
+          echo "Waiting for API..."
+          for i in {1..30}; do
+            if curl -fsS http://localhost:5000/swagger > /dev/null; then
+              echo "API is up!"
+              break
+            fi
+            sleep 1
+          done
+
+          echo "Sending test order..."
+          curl -fsS -X POST http://localhost:5000/orders \
+            -H "Content-Type: application/json" \
+            -d '{"customerEmail":"ci@example.com","total":123.45}'
+
+          sleep 5
+
+          echo "Checking consumer logs..."
+          if ! grep -i "order" consumer.log > /dev/null; then
+            echo "Integration test failed!"
+            echo "----- API LOG -----"
+            cat api.log || true
+            echo "----- CONSUMER LOG -----"
+            cat consumer.log || true
+            exit 1
+          fi
+
+          echo "Integration test passed!"
+
+          kill $API_PID || true
+          kill $CONSUMER_PID || true
